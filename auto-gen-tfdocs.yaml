@@ -1,0 +1,126 @@
+name: Generate terraform-docs
+on:
+  pull_request:
+    paths:
+      - "**/*.tf"
+      - "**/.terraform-docs.yml"
+      - ".terraform-docs.yml"
+      - ".github/workflows/auto-gen-tfdocs.yaml"
+
+permissions:
+  contents: write
+
+env:
+  TF_DOCS_VERSION: 0.20.0
+
+jobs:
+  docs:
+    name: Update terraform-docs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find changed module directories
+        id: mods
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+
+          changed="$(git diff --name-only --diff-filter=ACMR "$base" "$head" || true)"
+
+          if [[ -z "$changed" ]]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          #if the root config or workflow changed, rebuild docs for all top-level module dirs.
+          if grep -qE '^(\.terraform-docs\.ya?ml|\.github/workflows/tfdocs-autogen\.yaml)$' <<< "$changed"; then
+            all_mods="$(find . -mindepth 1 -maxdepth 1 -type d ! -name '.github' ! -name '.git' -printf '%f\n')"
+            if [[ -z "$all_mods" ]]; then
+              echo "empty=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            {
+              echo 'list<<__LIST__'
+              printf '%s\n' "$all_mods"
+              echo '__LIST__'
+              echo 'empty=false'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          #otherwise: only modules that changed in this PR.
+
+          mods="$(
+            printf '%s\n' "$changed" \
+            | awk -F/ 'NF>1 {print $1}' \
+            | grep -vE '^\.(github|git)$' || true \
+            | sort -u \
+            | while read -r d; do [[ -d "$d" ]] && printf '%s\n' "$d"; done || true \
+            | tr '\n' ' ' | sed 's/ $//'
+          )"
+
+          if [[ -z "$mods" ]]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo 'list<<__LIST__'
+              printf '%s\n' "$mods"
+              echo '__LIST__'
+              echo 'empty=false'
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install terraform-docs
+        if: steps.mods.outputs.empty != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMP_DIR="$(mktemp -d)"
+          curl -fsSL -o "$TMP_DIR/terraform-docs-v${{ env.TF_DOCS_VERSION }}-linux-amd64.tar.gz" \
+            "https://github.com/terraform-docs/terraform-docs/releases/download/v${{ env.TF_DOCS_VERSION }}/terraform-docs-v${{ env.TF_DOCS_VERSION }}-linux-amd64.tar.gz"
+          curl -fsSL -o "$TMP_DIR/terraform-docs-v${{ env.TF_DOCS_VERSION }}.sha256sum" \
+              "https://github.com/terraform-docs/terraform-docs/releases/download/v${{ env.TF_DOCS_VERSION }}/terraform-docs-v${{ env.TF_DOCS_VERSION }}.sha256sum"
+          grep ' terraform-docs-v${{ env.TF_DOCS_VERSION }}-linux-amd64.tar.gz$' "$TMP_DIR/terraform-docs-v${{ env.TF_DOCS_VERSION }}.sha256sum" > "$TMP_DIR/terraform-docs-linux.sha256"
+          (cd "$TMP_DIR" && sha256sum --check terraform-docs-linux.sha256 --status)
+          tar -xzf "$TMP_DIR/terraform-docs-v${{ env.TF_DOCS_VERSION }}-linux-amd64.tar.gz" -C "$TMP_DIR"
+          sudo install -m 0755 "$TMP_DIR/terraform-docs" /usr/local/bin/terraform-docs
+          rm -rf "$TMP_DIR"
+          terraform-docs --version
+
+      - name: Ensure README markers exist
+        if: steps.mods.outputs.empty != 'true'
+        shell: bash
+        run: |
+          while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            if [[ ! -f "$m/README.md" ]]; then
+              printf '%s\n%s\n' '<!-- BEGIN_TF_DOCS -->' '<!-- END_TF_DOCS -->' > "$m/README.md"
+            fi
+          done <<< "${{ steps.mods.outputs.list }}"
+
+      - name: Run terraform-docs for all changed modules
+        if: steps.mods.outputs.empty != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r m; do
+            [[ -z "$m" ]] && continue
+            echo "Updating $m"
+            terraform-docs --config .terraform-docs.yml "$m"
+          done <<< "${{ steps.mods.outputs.list }}"
+
+      - name: Commit & push changes
+        if: steps.mods.outputs.empty != 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(docs): update terraform-docs for tf modules"
+          commit_user_name: github-actions[bot]
+          commit_user_email: github-actions[bot]@users.noreply.github.com
+
