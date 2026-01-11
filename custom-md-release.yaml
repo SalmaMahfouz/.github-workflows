@@ -1,0 +1,186 @@
+name: Create Release Notes
+
+on:
+  #pull_request:
+   # types: [opened, edited, synchronize]
+  workflow_call:
+    inputs:
+      NEW_VERSION:
+        required: true
+        description: Version tag to create for the release (e.g., v1.2.3)
+        type: string
+      CREATE_RELEASE:
+        description: Create GitHub release with notes
+        type: boolean
+        default: true
+      BEFORE_SHA:
+        description: The commit SHA before the push
+        type: string
+        default: ""
+      PUSH_SHA:
+        description: The commit SHA after the push
+        type: string
+        default: ""
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  release:
+    if: inputs.CREATE_RELEASE
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Create GitHub Release Notes (scoped to this push, with commit list)
+        id: create_release 
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO:  ${{ github.repository }}
+          TAG:   ${{ inputs.NEW_VERSION }}
+          BEFORE: ${{ inputs.BEFORE_SHA }}
+          AFTER:  ${{ inputs.PUSH_SHA }}
+        run: | 
+          #!/usr/bin/env bash
+          set -euo pipefail
+          
+          # check if before or after commit SHAs are empty
+          if [[ -z "${BEFORE:-}" || -z "${AFTER:-}" ]]; then
+            echo "No BEFORE/AFTER provided; falling back to previous tag..HEAD"
+            prev="$(gh api "repos/$REPO/tags" --jq '.[0].name' || true)" #get the latest tag
+            BEFORE="$(git rev-list -n 1 "$prev" 2>/dev/null || true)" #get the commit SHA of the latest tag
+            AFTER="$(git rev-parse HEAD)" #get the current commit SHA
+          fi
+          echo "Commit range: ${BEFORE:0:7}...${AFTER:0:7}"
+      
+          #fill the array with commit SHAs in the range
+          mapfile -t SHAS < <(gh api "repos/$REPO/compare/$BEFORE...$AFTER" \
+            --jq '.commits[].sha') #extracts the commit SHAs from the comparison
+
+          # create an associative array to hold PR numbers - avoid duplicates
+          declare -A PRS=()
+          for sha in "${SHAS[@]}"; do
+          #fetch all PRs associated with that commit, and load their PR numbers into nums
+            mapfile -t nums < <(gh api "repos/$REPO/commits/$sha/pulls" \
+              --jq '.[].number' || true) 
+            for n in "${nums[@]:-}"; do PRS["$n"]=1; done
+          done
+      
+          if (( ${#PRS[@]} == 0 )); then # check if PRS array is empty
+            { 
+              echo "## Release $TAG" 
+              echo
+              echo "(No PRs detected in this push.)" 
+            } > NOTES.md 
+            gh release create "$TAG" --title "Release $TAG" --notes-file NOTES.md 
+            exit 0
+          fi
+      
+          # check commit subjects & PR titles to extract types
+          extract_types() {
+            awk 'BEGIN{IGNORECASE=1}
+                 /^[[:space:]]*feat/     {print "feat";     next}
+                 /^[[:space:]]*feature/  {print "feat";     next}
+                 /^[[:space:]]*fix/      {print "fix";      next}
+                 /^[[:space:]]*bugfix/   {print "fix";      next}
+                 /^[[:space:]]*chore/    {print "chore";    next}
+                 /^[[:space:]]*ci/       {print "ci";       next}
+                 /^[[:space:]]*docs/     {print "docs";     next}
+                 /^[[:space:]]*refactor/ {print "refactor"; next}
+                 /^[[:space:]]*test/     {print "test";     next}
+                ' | sort -u
+          }
+          is_breaking()      { grep -qiE '(^|[[:space:]])BREAKING[ -]?CHANGES?:' <<<"$1"; } #check for the presence of "BREAKING CHANGE"
+          has_bang_subject() {
+            grep -qiE '^(feat|feature|fix|bugfix|chore|ci|docs|refactor|test)(\([^)]+\))?\s*!\s*:' <<<"$1"
+          } #check the presence of !
+
+          # creates empty arrays for each category
+          declare -a BREAKING=() FEATURES=() FIXES=() OTHER=() UNCAT=()
+      
+          for pr in "${!PRS[@]}"; do
+            title="$(gh pr view "$pr" --json title --jq .title || true)" # get PR title
+            url="$(gh pr view "$pr" --json url --jq .url || true)" # get PR URL
+            messages="$(gh pr view "$pr" --json commits --jq '.commits[].message' || true)"  # get full commit messages
+            subjects="$(gh pr view "$pr" --json commits --jq '.commits[].messageHeadline // empty' || true)" # get commit subjects
+
+            # if it has ! or BREAKING CHANGE, add in the BREAKING section
+            if has_bang_subject "$subjects" || is_breaking "$messages"; then  
+              section="BREAKING"  
+            else
+              types="$( { printf '%s\n' "$title"; printf '%s\n' "$subjects"; } | extract_types )"  # create title + subjects pipe it into extract types to detect types
+              if grep -q '^feat$' <<<"$types"; then 
+                section="FEATURES"   
+              elif grep -q '^fix$' <<<"$types"; then 
+                section="FIXES"  
+              elif [[ -n "$types" ]]; then 
+                section="OTHER"  
+              else
+                section="UNCAT" 
+              fi
+            fi
+      
+            # build the PR block
+            pr_block=$(
+              {
+                echo "- $title ($url)" 
+                echo "  <details><summary>Commits</summary>" #creates a drop down list
+                echo 
+                while IFS= read -r line; do #loop over each commit subject
+                  [[ -n "$line" ]] && echo "  - $line"  #print it as sub bullet
+                done <<< "$subjects"
+                echo "  </details>" 
+              }
+            )
+      
+            # sort the PR block to the appropriate section
+            case "$section" in 
+              BREAKING) BREAKING+=("$pr_block") ;;
+              FEATURES) FEATURES+=("$pr_block") ;;
+              FIXES)    FIXES+=("$pr_block") ;;
+              OTHER)    OTHER+=("$pr_block") ;;
+              *)        UNCAT+=("$pr_block") ;;
+            esac
+          done
+      
+          # assemble and generate the release notes file
+          {
+            echo "## Release $TAG"
+            echo
+            if ((${#BREAKING[@]})); then      
+              echo "### 💥 Breaking Changes"       
+              printf '%s\n' "${BREAKING[@]}"            
+              echo
+            fi
+            if ((${#FEATURES[@]})); then    
+              echo "### 🚀 Features"           
+              printf '%s\n' "${FEATURES[@]}"       
+              echo
+            fi
+            if ((${#FIXES[@]})); then 
+              echo "### 🐛 Fixes"
+              printf '%s\n' "${FIXES[@]}"
+              echo
+            fi
+            if ((${#OTHER[@]})); then      
+              echo "### 🛠 Other"     
+              printf '%s\n' "${OTHER[@]}"      
+              echo
+            fi
+            if ((${#UNCAT[@]})); then    
+              echo "### Uncategorized"         
+              printf '%s\n' "${UNCAT[@]}"   
+              echo
+            fi
+            echo "Full Changelog (this push): https://github.com/$REPO/compare/${BEFORE}...${AFTER}"  
+          } > NOTES.md    
+      
+          echo "== Generated notes =="                
+          cat NOTES.md                       
+          echo "====================="
+      
+          gh release create "$TAG" --title "Release $TAG" --notes-file NOTES.md
