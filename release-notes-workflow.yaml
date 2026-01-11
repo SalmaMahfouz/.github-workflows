@@ -1,0 +1,223 @@
+name: Auto-label PRs & Create Release Notes
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+  workflow_call:
+    inputs:
+      NEW_VERSION:
+        required: true
+        description: Version tag to create for the release (e.g., v1.2.3)
+        type: string
+      CREATE_RELEASE:
+        description: Create GitHub release with notes
+        type: boolean
+        default: true
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  auto-label:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+      contents: read
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Ensure labels exist
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+           mk() {
+            if ! out=$(gh label create "$1" -c "$2" -d "$3" 2>&1); then
+              echo "Failed to create label '$1': $out" >&2
+            fi
+          }
+          mk feat              1f883d "Features"
+          mk feature           1f883d "Features"
+          mk fix               d73a4a "Bug fixes"
+          mk bugfix            d73a4a "Bug fixes"
+          mk breaking-change   b60205 "Breaking changes"
+          mk chore             6e7781 "Maintenance"
+          mk ci                6e7781 "CI"
+          mk docs              0e8a16 "Docs"
+          mk refactor          fbca04 "Refactors"
+          mk test              6f42c1 "Tests"
+
+      - name: Label this PR from Conventional Commit title/body
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          # Read title/body directly from the event payload
+          TITLE=$(jq -r '.pull_request.title' "$GITHUB_EVENT_PATH")
+          BODY=$(jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH")
+
+          # --- Gather all commit messagesfor this PR ---
+          # This allows to detect 'breaking change' if the PR title/body don't mention them
+          COMMITS="$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" --jq '.[].commit.message' || true)"
+
+          # get the first line of each commit message
+          SUBJECTS="$(gh api "repos/$REPO/pulls/$PR_NUMBER/commits" \
+            --jq '.[].commit.message | split("\n")[0]' || true)"
+
+          # Add commit messages to BODY so the grep covers PR body and commit messages
+          BODY="$BODY"$'\n'"$COMMITS"
+
+          # Regex pattern that matches commit titles
+          RE='^(feat|feature|fix|bugfix|chore|ci|docs|refactor|test)(\([^)]+\))?(!)?:'
+
+          # Checking if the PR title matches the pattern above.
+          if [[ $TITLE =~ $RE ]]; then
+          # If matches, BASH_REMATCH gets filled with the parts of the title:
+            TYPE="${BASH_REMATCH[1],,}" #get BASH_REMATCH[1] (ex: feat, fix, etc.) & convert it to lowercase.
+            BANG="${BASH_REMATCH[3]:-}" #should capture the ! if exists.
+          else
+            TYPE=""
+            BANG=""
+          fi
+
+          # extracts all types from title and commit subjects
+          #add the extracted output to the array type_labels
+          mapfile -t type_labels < <(
+            printf '%s\n' "$TITLE" $'\n' "$SUBJECTS" | # print the PR title and every commit subject
+            grep -Eoi '^(feat|feature|fix|bugfix|chore|ci|docs|refactor|test)' | # find lines starting with any known commit type
+            tr '[:upper:]' '[:lower:]' | # convert all matches to lowercase for consistency
+            sed -E 's/^feature$/feat/; s/^bugfix$/fix/' | # normalize aliases: "feature"→"feat", "bugfix"→"fix"
+            sort -u # sort results and remove duplicates
+          )
+
+          # Detect breaking changes in three possibilities:
+          has_break=false
+
+          # 1 PR title has "!"
+          if [[ -n "$BANG" ]]; then
+            has_break=true
+          fi
+
+          # 2 Any commit message uses a bang: ex "type!:"
+          if printf '%s\n' "$SUBJECTS" | grep -qiE \
+             '^(feat|feature|fix|bugfix|chore|ci|docs|refactor|test)(\([^)]+\))?(!):'; then
+            has_break=true
+          fi
+
+          # 3 PR body or any commit message has a BREAKING footer
+          if grep -qiE '(^|[[:space:]])BREAKING[ -]?CHANGES?:' <<<"$BODY"; then
+            has_break=true
+          fi
+          
+          # a helper function, takes an array of commit types, and decides which one would be considered
+          pick_top_type() {
+            local -a types=("$@") #array variable, -a ensures it is an array and local keeps it inside the function
+            for want in feat fix chore ci docs refactor test; do #loop through the desired order of types
+              for t in "${types[@]}"; do
+                if [[ "$t" == "$want" ]]; then #compare the type from the PR with the desired type (want)
+                  echo "$want"
+                  return 0
+                fi
+              done
+            done
+            echo ""
+          } 
+          
+          # Determine the top type from the collected type_labels
+          TOP_TYPE="$(pick_top_type "${type_labels[@]}")"
+
+
+          # check if variable is not empty, if non empty, PR title needs to be edited
+          if [[ -n "$TOP_TYPE" ]]; then
+          TITLE_FULL_RE='^(feat|feature|fix|bugfix|chore|ci|docs|refactor|test)(\([^)]+\))?(!)?:[[:space:]]*(.*)$'
+            if [[ "$TITLE" =~ $TITLE_FULL_RE ]]; then #check whether the PR title matches the conventional commit pattern
+              REST="${BASH_REMATCH[4]}" #extract the rest of the title after the type(scope)!:
+            else
+              REST="$TITLE"
+            fi
+            
+            #build the new pr title
+            NEW_TITLE="$TOP_FOR_TITLE: $REST"
+
+            # in case the new title is not the current title, edit it
+            if [[ "$NEW_TITLE" != "$TITLE" ]]; then
+              echo "Updating PR title to: $NEW_TITLE"
+              gh pr edit "$PR_NUMBER" --title "$NEW_TITLE"
+            fi
+          fi
+
+          # Building thhe set of labels that the PR should've right now
+          desired=()
+          for L in "${type_labels[@]}"; do #add every type found in title or commit subjects
+            desired+=("$L")
+          done
+          $has_break && desired+=("breaking-change") #if has_break is true add breaking-change to desired
+
+          # Get current labels on the PR, extract the lables & store them in an array (current)
+          mapfile -t current < <(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name')
+
+          # setting a list of lables that this workflow allowed to change
+          managed=(feat feature fix bugfix chore ci docs refactor test breaking-change)
+          
+          # helper function, to check if a specific value exist inside a list. used to deicde which labels to add/remove
+          contains() { local n="$1"; shift; for x in "$@"; do [[ "$x" == "$n" ]] && return 0; done; return 1; }
+          
+          # determine which label to add, if in desired and not in current, add
+          adds=()
+          for d in "${desired[@]}"; do
+            contains "$d" "${current[@]}" || adds+=("$d")
+          done
+
+          # determine which label to remove, if in current and in managed but not in desired, remove
+          removes=()
+          for c in "${current[@]}"; do
+            contains "$c" "${managed[@]}" || continue
+            contains "$c" "${desired[@]}" || removes+=("$c")
+          done
+          
+          # turn array into a comma-separaretd list
+          join_csv() { local out=""; for x in "$@"; do out+="${out:+,}$x"; done; printf '%s' "$out"; }
+
+          #Apply labels to the PR 
+          if ((${#adds[@]})); then
+            #gh pr edit "$PR_NUMBER" --add-label "$(IFS=,; echo "${labels[*]}")"
+            gh pr edit "$PR_NUMBER" --add-label "$(join_csv "${adds[@]}")"
+            echo "Added labels: $(join_csv "${adds[@]}")"
+          fi
+          if ((${#removes[@]})); then
+            gh pr edit "$PR_NUMBER" --remove-label "$(join_csv "${removes[@]}")"
+            echo "Removed labels: $(join_csv "${removes[@]}")"
+          fi
+          if ! ((${#adds[@]})) && ! ((${#removes[@]})); then
+            echo "Labels already up to date."
+          fi
+
+  release:
+    if: inputs.CREATE_RELEASE
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Create GitHub Release Notes
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ inputs.NEW_VERSION }}" \
+            --generate-notes \
+            --title "Release ${{ inputs.NEW_VERSION }}" \
